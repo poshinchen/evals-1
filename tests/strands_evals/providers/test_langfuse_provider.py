@@ -648,6 +648,76 @@ class TestLangChainToolType:
         assert tools[0].tool_call.name == "echo"
         assert tools[0].tool_call.arguments == {"input": "hello"}
 
+    def test_tool_type_strands_otel_list_input(self, provider, mock_client):
+        """TOOL with Strands OTEL list input parses arguments from item content (issue #312)."""
+        spans = self._get_spans(
+            provider,
+            mock_client,
+            [
+                _obs(
+                    "o-tool",
+                    "t1",
+                    "TOOL",
+                    name="bsm-get-case",
+                    obs_input=[
+                        {
+                            "role": "tool",
+                            "content": '{"caseId": "abc123", "marketplaceId": "ATVPDKIKX0DER"}',
+                            "id": "tooluse_x",
+                        }
+                    ],
+                    obs_output={"message": '[{"text": "Data stored under key bsm-get-case (9 fields)"}]'},
+                ),
+                _obs("o-agent", "t1", "SPAN", name="invoke_agent a", obs_input=[{"text": "q"}], obs_output="a"),
+            ],
+        )
+        tools = [s for s in spans if isinstance(s, ToolExecutionSpan)]
+        assert tools[0].tool_call.name == "bsm-get-case"
+        assert tools[0].tool_call.arguments == {"caseId": "abc123", "marketplaceId": "ATVPDKIKX0DER"}
+        assert tools[0].tool_result.content == "Data stored under key bsm-get-case (9 fields)"
+        assert tools[0].tool_result.error is None
+
+    def test_tool_type_strands_otel_list_input_non_json_content(self, provider, mock_client):
+        """TOOL list input with non-JSON content wraps it as {"input": content}."""
+        spans = self._get_spans(
+            provider,
+            mock_client,
+            [
+                _obs(
+                    "o-tool",
+                    "t1",
+                    "TOOL",
+                    name="echo",
+                    obs_input=[{"role": "tool", "content": "just a string"}],
+                    obs_output="ok",
+                ),
+                _obs("o-agent", "t1", "SPAN", name="invoke_agent a", obs_input=[{"text": "q"}], obs_output="a"),
+            ],
+        )
+        tools = [s for s in spans if isinstance(s, ToolExecutionSpan)]
+        assert tools[0].tool_call.arguments == {"input": "just a string"}
+
+    def test_tool_type_strands_otel_message_output_plain_string(self, provider, mock_client):
+        """TOOL output with a plain-string message key falls back to the raw string."""
+        spans = self._get_spans(
+            provider,
+            mock_client,
+            [
+                _obs(
+                    "o-tool",
+                    "t1",
+                    "TOOL",
+                    name="search",
+                    obs_input=[{"role": "tool", "content": '{"q": "weather"}'}],
+                    obs_output={"message": "Sunny and 72F"},
+                ),
+                _obs("o-agent", "t1", "SPAN", name="invoke_agent a", obs_input=[{"text": "q"}], obs_output="a"),
+            ],
+        )
+        tools = [s for s in spans if isinstance(s, ToolExecutionSpan)]
+        assert tools[0].tool_call.arguments == {"q": "weather"}
+        assert tools[0].tool_result.content == "Sunny and 72F"
+
 
 class TestLangChainChainType:
     """CHAIN-type observations from LangChain via Langfuse."""

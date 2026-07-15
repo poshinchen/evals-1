@@ -440,13 +440,18 @@ class LangfuseProvider(TraceProvider):
         Handles two formats:
 
         **Strands** (obs.type == "SPAN", name starts with "execute_tool"):
-            obs.input: ``{"name": "calc", "arguments": {"x": "2+2"}, "toolUseId": "..."}``
-            obs.output: ``"42"`` or ``{"result": "4", "status": "success"}``
+            obs.input: `{"name": "calc", "arguments": {"x": "2+2"}, "toolUseId": "..."}`
+            obs.output: `"42"` or `{"result": "4", "status": "success"}`
 
         **LangChain / universal** (obs.type == "TOOL"):
-            obs.name: tool name (e.g. ``"add_numbers"``)
+            obs.name: tool name (e.g. `"add_numbers"`)
             obs.input: tool arguments (dict or other)
             obs.output: tool result
+
+        **Strands OTEL** (obs.type == "TOOL", from OTEL instrumentation):
+            obs.name: tool name (e.g. `"bsm-get-case"`)
+            obs.input: `[{"role": "tool", "content": "<JSON args>", "id": "tooluse_..."}]`
+            obs.output: `{"message": "<JSON string of [{\"text\": ...}]>", "id": "tooluse_..."}`
         """
         span_info = self._create_span_info(obs, session_id)
         obs_input = obs.input or {}
@@ -461,6 +466,9 @@ class LangfuseProvider(TraceProvider):
             tool_name = obs.name or ""
             if isinstance(obs_input, dict):
                 tool_arguments = obs_input
+            elif isinstance(obs_input, list):
+                # Strands OTEL format: [{"role": "tool", "content": "<JSON args>", "id": "..."}]
+                tool_arguments = self._parse_tool_arguments_from_list(obs_input)
             elif isinstance(obs_input, str):
                 # Try parsing as JSON; LangChain may send stringified dicts
                 try:
@@ -486,16 +494,43 @@ class LangfuseProvider(TraceProvider):
             span_info=span_info, tool_call=tool_call, tool_result=tool_result, metadata=obs.metadata or {}
         )
 
+    def _parse_tool_arguments_from_list(self, obs_input: list) -> dict:
+        """Extract tool arguments from a Strands OTEL TOOL-message list.
+
+        Input format:
+            `[{"role": "tool", "content": "<JSON args>", "id": "tooluse_..."}]`
+
+        The actual arguments live in the first item's `content` field as a
+        JSON string. Returns the parsed dict, or `{"input": <content>}` when
+        the content is not JSON, or `{"input": str(obs_input)}` when no item
+        carries a `content` field.
+        """
+        for item in obs_input:
+            if isinstance(item, dict) and "content" in item:
+                content = item["content"]
+                if isinstance(content, dict):
+                    return content
+                if isinstance(content, str):
+                    try:
+                        parsed = json.loads(content)
+                    except (json.JSONDecodeError, ValueError):
+                        return {"input": content}
+                    return parsed if isinstance(parsed, dict) else {"input": content}
+                return {"input": str(content)}
+        return {"input": str(obs_input)}
+
     def _parse_tool_result(self, obs_output: Any) -> tuple[str, str | None]:
         """Parse tool execution output into (content, error).
 
         Input formats:
-            str:  ``"42"``                                            → ``("42", None)``
-            dict: ``{"result": "4", "status": "success"}``            → ``("4", None)``
-            dict: ``{"result": "...", "status": "error"}``             → ``("...", "error")``
-            dict: ``{"content": "Weather...", "type": "tool", ...}``   → ``("Weather...", None)``
+            str:  `"42"`                                            → `("42", None)`
+            dict: `{"result": "4", "status": "success"}`            → `("4", None)`
+            dict: `{"result": "...", "status": "error"}`             → `("...", "error")`
+            dict: `{"content": "Weather...", "type": "tool", ...}`   → `("Weather...", None)`
                   (LangChain ToolMessage format via Langfuse)
-            None:                                                      → ``("", None)``
+            dict: `{"message": "<JSON of [{\"text\": ...}]>", ...}`  → `("...", None)`
+                  (Strands OTEL TOOL format via Langfuse)
+            None:                                                    → `("", None)`
         """
         if isinstance(obs_output, str):
             return obs_output, None
@@ -507,6 +542,9 @@ class LangfuseProvider(TraceProvider):
                 status = obs_output.get("status", "")
                 error = None if status == "success" else (str(status) if status else None)
                 return content, error
+            # Strands OTEL format: {"message": "<JSON string of [{\"text\": ...}]>", "id": "..."}
+            if "message" in obs_output:
+                return self._parse_tool_result_message(obs_output["message"]), None
             # LangChain ToolMessage format: {"content": "...", "type": "tool", ...}
             if "content" in obs_output:
                 content = obs_output["content"]
@@ -517,6 +555,28 @@ class LangfuseProvider(TraceProvider):
 
         content = str(obs_output) if obs_output is not None else ""
         return content, None
+
+    def _parse_tool_result_message(self, message: Any) -> str:
+        """Extract tool result text from a Strands OTEL `message` field.
+
+        Input format:
+            str (JSON): `'[{"text": "result text"}]'`  → `"result text"`
+            str:        `"plain text"`                  → `"plain text"`
+            list[dict]: `[{"text": "result text"}]`     → `"result text"`
+            other:                                       → `str(message)`
+
+        Falls back to the raw string when the JSON does not decode to a
+        non-empty list of text blocks.
+        """
+        if isinstance(message, str):
+            try:
+                parsed = json.loads(message)
+            except (json.JSONDecodeError, ValueError):
+                return message
+            return self._first_text_from_list(parsed) or message
+        if isinstance(message, list):
+            return self._first_text_from_list(message) or str(message)
+        return str(message)
 
     def _convert_agent_invocation(self, obs: Any, session_id: str) -> AgentInvocationSpan:
         """Convert an agent observation to an AgentInvocationSpan.
