@@ -543,6 +543,8 @@ class LangfuseProvider(TraceProvider):
                 error = None if status == "success" else (str(status) if status else None)
                 return content, error
             # Strands OTEL format: {"message": "<JSON string of [{\"text\": ...}]>", "id": "..."}
+            # This payload carries no error/status field; failed tool calls surface a
+            # "result"/"status" dict instead, handled by the branch above.
             if "message" in obs_output:
                 return self._parse_tool_result_message(obs_output["message"]), None
             # LangChain ToolMessage format: {"content": "...", "type": "tool", ...}
@@ -568,15 +570,7 @@ class LangfuseProvider(TraceProvider):
         Falls back to the raw string when the JSON does not decode to a
         non-empty list of text blocks.
         """
-        if isinstance(message, str):
-            try:
-                parsed = json.loads(message)
-            except (json.JSONDecodeError, ValueError):
-                return message
-            return self._first_text_from_list(parsed) or message
-        if isinstance(message, list):
-            return self._first_text_from_list(message) or str(message)
-        return str(message)
+        return self._extract_text_from_content(message) or str(message)
 
     def _convert_agent_invocation(self, obs: Any, session_id: str) -> AgentInvocationSpan:
         """Convert an agent observation to an AgentInvocationSpan.
