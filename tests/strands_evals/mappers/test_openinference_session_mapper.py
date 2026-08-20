@@ -20,10 +20,13 @@ _ADOT_SPANS_FILE = _FIXTURES_DIR / "openinference_adot_spans.json"
 _SMOLAGENTS_SPANS_FILE = _FIXTURES_DIR / "smolagents_live_spans.json"
 _CLAUDE_SPANS_FILE = _FIXTURES_DIR / "claude_live_spans.json"
 _CLAUDE_ADOT_FILE = _FIXTURES_DIR / "claude_adot_spans.json"
+_OPENAI_AGENTS_LIVE_FILE = _FIXTURES_DIR / "openai_agents_openinference_live_spans.json"
+_OPENAI_AGENTS_ADOT_FILE = _FIXTURES_DIR / "openai_agents_openinference_adot_spans.json"
 
 SCOPE_NAME = "openinference.instrumentation.langchain"
 SMOLAGENTS_SCOPE_NAME = "openinference.instrumentation.smolagents"
 CLAUDE_SDK_SCOPE_NAME = "openinference.instrumentation.claude_agent_sdk"
+OPENAI_AGENTS_SCOPE_NAME = "openinference.instrumentation.openai_agents"
 
 
 def make_span(
@@ -201,6 +204,18 @@ def _load_claude_adot_spans():
     with open(_CLAUDE_ADOT_FILE, encoding="utf-8") as f:
         data = json.load(f)
     return data["session_id"], data["spans"]
+
+
+def _load_openai_agents_live_spans():
+    """Load real OpenAI Agents SDK (openinference-instrumentation-openai-agents) live spans."""
+    with open(_OPENAI_AGENTS_LIVE_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _load_openai_agents_adot_spans():
+    """Load OpenAI Agents SDK spans from AgentCore (multi-agent with handoffs)."""
+    with open(_OPENAI_AGENTS_ADOT_FILE, encoding="utf-8") as f:
+        return json.load(f)
 
 
 class TestSpanTypeDetection:
@@ -2146,3 +2161,649 @@ class TestClaudeAgentCoreFixtureIntegration:
         for span in spans:
             attrs = span.get("attributes", {})
             assert attrs.get("session.id") == session_id
+
+
+# =============================================================================
+# OpenAI Agents SDK Scope Support
+# (openinference.instrumentation.openai_agents)
+#
+# OpenAI Agents SDK instrumentation emits AGENT spans (for the agent itself),
+# CHAIN spans (for turns), LLM spans (for response calls), and TOOL spans.
+# AGENT spans lack input/output; the normalization step walks descendants to
+# inject user_prompt and agent_response from LLM spans.
+# =============================================================================
+
+
+class TestOpenAIAgentsScopeSupport:
+    """OpenAI Agents SDK-scoped spans: acceptance and conversion."""
+
+    def setup_method(self):
+        self.mapper = OpenInferenceSessionMapper()
+
+    def test_openai_agent_span_detected(self):
+        """AGENT span from openai_agents scope with input+output is agent invocation."""
+        span = make_span(
+            name="math_agent",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "AGENT",
+                "input.value": "What is 15 multiplied by 37?",
+                "output.value": "15 multiplied by 37 is 555.",
+            },
+        )
+        assert self.mapper._is_agent_invocation_span(span) is True
+
+    def test_openai_agent_span_without_input_rejected(self):
+        """AGENT span from openai_agents scope without input is NOT agent invocation."""
+        span = make_span(
+            name="Agent workflow",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "AGENT",
+            },
+        )
+        assert self.mapper._is_agent_invocation_span(span) is False
+
+    def test_openai_llm_span_detected_as_inference(self):
+        """LLM span from openai_agents scope detected as inference."""
+        span = make_span(
+            name="response",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "LLM",
+                "llm.input_messages.0.message.role": "system",
+                "llm.input_messages.0.message.content": "You are a math assistant.",
+                "llm.input_messages.1.message.role": "user",
+                "llm.input_messages.1.message.content": "What is 15 * 37?",
+                "llm.output_messages.0.message.role": "assistant",
+                "llm.output_messages.0.message.tool_calls.0.tool_call.function.name": "calculator",
+                "llm.output_messages.0.message.tool_calls.0.tool_call.function.arguments": '{"expression":"15 * 37"}',
+                "llm.output_messages.0.message.tool_calls.0.tool_call.id": "call_abc123",
+            },
+        )
+        assert self.mapper._is_inference_span(span) is True
+
+    def test_openai_tool_span_detected(self):
+        """TOOL span from openai_agents scope detected as tool execution."""
+        span = make_span(
+            name="calculator",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "TOOL",
+                "tool.name": "calculator",
+                "input.value": '{"expression":"15 * 37"}',
+                "input.mime_type": "application/json",
+                "output.value": "555",
+            },
+        )
+        assert self.mapper._is_tool_execution_span(span) is True
+
+    def test_openai_chain_span_not_agent_invocation(self):
+        """CHAIN span from openai_agents scope is NOT detected as agent invocation."""
+        span = make_span(
+            name="turn",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "CHAIN",
+            },
+        )
+        assert self.mapper._is_agent_invocation_span(span) is False
+
+    def test_openai_agent_span_conversion(self):
+        """AGENT span with input+output produces AgentInvocationSpan."""
+        span = make_span(
+            name="math_agent",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "AGENT",
+                "input.value": "What is 15 multiplied by 37?",
+                "output.value": "15 multiplied by 37 is 555.",
+                "graph.node.id": "math_agent",
+                "llm.tools.0.tool.json_schema": json.dumps(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "calculator",
+                            "description": "Evaluate a mathematical expression.",
+                            "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}},
+                        },
+                    }
+                ),
+            },
+        )
+        session = self.mapper.map_to_session([span], "sess-1")
+
+        all_spans = [s for t in session.traces for s in t.spans]
+        agent_spans = [s for s in all_spans if isinstance(s, AgentInvocationSpan)]
+        assert len(agent_spans) == 1
+        assert agent_spans[0].user_prompt == "What is 15 multiplied by 37?"
+        assert agent_spans[0].agent_response == "15 multiplied by 37 is 555."
+        assert len(agent_spans[0].available_tools) == 1
+        tool = agent_spans[0].available_tools[0]
+        assert tool.name == "calculator"
+        assert tool.parameters == {"type": "object", "properties": {"expression": {"type": "string"}}}
+
+    def test_openai_tool_span_bare_string_output(self):
+        """TOOL span with bare string output.value (not JSON) produces ToolExecutionSpan."""
+        span = make_span(
+            name="calculator",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "TOOL",
+                "tool.name": "calculator",
+                "input.value": '{"expression":"15 * 37"}',
+                "input.mime_type": "application/json",
+                "output.value": "555",
+            },
+        )
+        session = self.mapper.map_to_session([span], "sess-1")
+
+        tool_spans = [s for t in session.traces for s in t.spans if isinstance(s, ToolExecutionSpan)]
+        assert len(tool_spans) == 1
+        assert tool_spans[0].tool_call.name == "calculator"
+        assert tool_spans[0].tool_call.arguments == {"expression": "15 * 37"}
+        assert tool_spans[0].tool_result.content == "555"
+
+    def test_openai_normalization_injects_input_output_on_agent_span(self):
+        """Normalization walks LLM descendants to inject input/output on AGENT span."""
+        # Simulate the real span structure: AGENT → CHAIN(turn) → LLM(response)
+        agent_span = make_span(
+            trace_id="t1",
+            span_id="agent-1",
+            name="math_agent",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "AGENT",
+                "graph.node.id": "math_agent",
+            },
+        )
+        turn_span = make_span(
+            trace_id="t1",
+            span_id="turn-1",
+            parent_span_id="agent-1",
+            name="turn",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "CHAIN",
+            },
+        )
+        llm_span = make_span(
+            trace_id="t1",
+            span_id="llm-1",
+            parent_span_id="turn-1",
+            name="response",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "LLM",
+                "llm.input_messages.0.message.role": "system",
+                "llm.input_messages.0.message.content": "You are a math assistant.",
+                "llm.input_messages.1.message.role": "user",
+                "llm.input_messages.1.message.content": "What is 5 + 3?",
+                "llm.output_messages.0.message.role": "assistant",
+                "llm.output_messages.0.message.contents.0.message_content.type": "text",
+                "llm.output_messages.0.message.contents.0.message_content.text": "5 + 3 is 8.",
+                "llm.output_messages.0.message.content": "5 + 3 is 8.",
+                "llm.tools.0.tool.json_schema": json.dumps(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "calculator",
+                            "description": "Evaluate math.",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ),
+            },
+        )
+
+        session = self.mapper.map_to_session([agent_span, turn_span, llm_span], "sess-1")
+
+        agent_spans = [s for t in session.traces for s in t.spans if isinstance(s, AgentInvocationSpan)]
+        assert len(agent_spans) == 1
+        assert agent_spans[0].user_prompt == "What is 5 + 3?"
+        assert agent_spans[0].agent_response == "5 + 3 is 8."
+        assert len(agent_spans[0].available_tools) == 1
+        assert agent_spans[0].available_tools[0].name == "calculator"
+
+    def test_openai_errored_agent_span_detected(self):
+        """AGENT span with input.value + ERROR status is detected as agent invocation."""
+        span = make_span(
+            name="math_agent",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "AGENT",
+                "input.value": "Calculate something complex",
+            },
+        )
+        span["status"] = {"code": "ERROR", "description": "Rate limit exceeded"}
+
+        assert self.mapper._is_agent_invocation_span(span) is True
+
+        session = self.mapper.map_to_session([span], "sess-1")
+        agent_spans = [s for t in session.traces for s in t.spans if isinstance(s, AgentInvocationSpan)]
+        assert len(agent_spans) == 1
+        assert agent_spans[0].user_prompt == "Calculate something complex"
+        assert agent_spans[0].agent_response == "Rate limit exceeded"
+
+    def test_openai_handoff_tool_span_with_error_status(self):
+        """Handoff TOOL span with ERROR status produces ToolExecutionSpan with error."""
+        span = make_span(
+            name="handoff to math_specialist",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "TOOL",
+                "input.value": "coordinator",
+                "output.value": "math_specialist",
+            },
+        )
+        span["status"] = {"code": "ERROR"}
+
+        session = self.mapper.map_to_session([span], "sess-1")
+        # Handoff spans with plain string input/output should still parse
+        tool_spans = [s for t in session.traces for s in t.spans if isinstance(s, ToolExecutionSpan)]
+        assert len(tool_spans) == 1
+
+    def test_normalization_survives_heterogeneous_start_times(self):
+        """Descendant LLM sort tolerates mixed start_time types (int / ISO str / None).
+
+        parse_timestamp normalizes each to a comparable datetime, so the sort no
+        longer raises TypeError on a group with heterogeneous timestamps.
+        """
+        agent = make_span(
+            trace_id="t1",
+            span_id="agent-1",
+            name="math_agent",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={"openinference.span.kind": "AGENT"},
+        )
+        # Two turns, each with an LLM descendant, carrying incompatible start_time types.
+        llm_common = {
+            "openinference.span.kind": "LLM",
+            "llm.input_messages.0.message.role": "user",
+            "llm.input_messages.0.message.content": "What is 5 + 3?",
+            "llm.output_messages.0.message.role": "assistant",
+            "llm.output_messages.0.message.content": "5 + 3 is 8.",
+        }
+        turn_a = make_span(
+            trace_id="t1",
+            span_id="turn-a",
+            parent_span_id="agent-1",
+            name="turn",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={"openinference.span.kind": "CHAIN"},
+        )
+        llm_a = make_span(
+            trace_id="t1",
+            span_id="llm-a",
+            parent_span_id="turn-a",
+            name="response",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes=dict(llm_common),
+            start_time=1700000005000000000,
+        )  # int ns
+        turn_b = make_span(
+            trace_id="t1",
+            span_id="turn-b",
+            parent_span_id="agent-1",
+            name="turn",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={"openinference.span.kind": "CHAIN"},
+        )
+        llm_b = make_span(
+            trace_id="t1",
+            span_id="llm-b",
+            parent_span_id="turn-b",
+            name="response",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes=dict(llm_common),
+            start_time="2024-01-01T00:00:00Z",
+        )  # ISO string
+
+        # Should not raise, and the agent span is still produced.
+        session = self.mapper.map_to_session([agent, turn_a, llm_a, turn_b, llm_b], "sess-1")
+        agent_spans = [s for t in session.traces for s in t.spans if isinstance(s, AgentInvocationSpan)]
+        assert len(agent_spans) == 1
+        assert agent_spans[0].user_prompt == "What is 5 + 3?"
+        assert agent_spans[0].agent_response == "5 + 3 is 8."
+
+    def test_normalization_survives_none_attributes_span(self):
+        """A span with attributes=None in the group is skipped, not fatal to the session."""
+        agent = make_span(
+            trace_id="t1",
+            span_id="agent-1",
+            name="math_agent",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={"openinference.span.kind": "AGENT"},
+        )
+        turn = make_span(
+            trace_id="t1",
+            span_id="turn-1",
+            parent_span_id="agent-1",
+            name="turn",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={"openinference.span.kind": "CHAIN"},
+        )
+        llm = make_span(
+            trace_id="t1",
+            span_id="llm-1",
+            parent_span_id="turn-1",
+            name="response",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "LLM",
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "What is 5 + 3?",
+                "llm.output_messages.0.message.role": "assistant",
+                "llm.output_messages.0.message.content": "5 + 3 is 8.",
+            },
+        )
+        # Malformed sibling: attributes explicitly None (not absent).
+        bad = make_span(trace_id="t1", span_id="bad-1", parent_span_id="turn-1", scope_name=OPENAI_AGENTS_SCOPE_NAME)
+        bad["attributes"] = None
+
+        session = self.mapper.map_to_session([agent, turn, llm, bad], "sess-1")
+        agent_spans = [s for t in session.traces for s in t.spans if isinstance(s, AgentInvocationSpan)]
+        assert len(agent_spans) == 1
+        assert agent_spans[0].user_prompt == "What is 5 + 3?"
+
+    def test_extract_last_message_text_uses_current_turn_user_message(self):
+        """Multi-turn input: the highest-indexed user message wins, not the oldest."""
+        attrs = {
+            "llm.input_messages.0.message.role": "system",
+            "llm.input_messages.0.message.content": "You are helpful.",
+            "llm.input_messages.1.message.role": "user",
+            "llm.input_messages.1.message.content": "What is 15 * 37?",
+            "llm.input_messages.2.message.role": "assistant",
+            "llm.input_messages.2.message.content": "555",
+            "llm.input_messages.3.message.role": "user",
+            "llm.input_messages.3.message.content": "Now divide it by 5",
+        }
+        result = self.mapper._extract_last_message_text(attrs, "llm.input_messages", role="user")
+        assert result == "Now divide it by 5"
+
+    def test_extract_last_message_text_skips_reasoning_item(self):
+        """A reasoning item at the highest output index is skipped for the real answer."""
+        attrs = {
+            "llm.output_messages.0.message.role": "assistant",
+            "llm.output_messages.0.message.content": "The answer is 8.",
+            "llm.output_messages.1.message.role": "assistant",
+            "llm.output_messages.1.message.contents.0.message_content.type": "reasoning",
+            "llm.output_messages.1.message.contents.0.message_content.text": "Let me think step by step...",
+        }
+        result = self.mapper._extract_last_message_text(attrs, "llm.output_messages")
+        assert result == "The answer is 8."
+
+    def test_extract_last_tool_calls_renders_names_and_args(self):
+        """Tool calls render as name(args); empty-arg calls render as name(); joined by '; '."""
+        attrs = {
+            "llm.output_messages.0.message.role": "assistant",
+            "llm.output_messages.0.message.tool_calls.0.tool_call.function.name": "ask_math_specialist",
+            "llm.output_messages.0.message.tool_calls.0.tool_call.function.arguments": '{"query":"42 * 17"}',
+            "llm.output_messages.0.message.tool_calls.1.tool_call.function.name": "ask_research_specialist",
+        }
+        result = self.mapper._extract_last_tool_calls(attrs)
+        assert result == 'ask_math_specialist({"query":"42 * 17"}); ask_research_specialist()'
+
+    def test_bridge_crosses_foreign_scope_spans(self):
+        """Spans bridge through filtered-out foreign-scope ancestors to reach converted parents."""
+        agent = make_span(
+            trace_id="t1",
+            span_id="agent-1",
+            name="math_agent",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={"openinference.span.kind": "AGENT", "input.value": "q", "output.value": "a"},
+        )
+        http = make_span(
+            trace_id="t1",
+            span_id="http-1",
+            parent_span_id="agent-1",
+            name="POST",
+            scope_name="opentelemetry.instrumentation.httpx",
+            attributes={},
+        )
+        tool = make_span(
+            trace_id="t1",
+            span_id="tool-1",
+            parent_span_id="http-1",
+            name="calculator",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={
+                "openinference.span.kind": "TOOL",
+                "tool.name": "calculator",
+                "input.value": "{}",
+                "output.value": "42",
+            },
+        )
+        session = self.mapper.map_to_session([agent, http, tool], "sess-1")
+        tool_spans = [s for t in session.traces for s in t.spans if isinstance(s, ToolExecutionSpan)]
+        assert len(tool_spans) == 1
+        assert tool_spans[0].span_info.parent_span_id == "agent-1"
+        assert tool_spans[0].agent_span_id == "agent-1"
+
+    def test_foreign_scope_llm_not_used_for_agent_normalization(self):
+        """A non-OpenAI LLM span nested under an OpenAI AGENT is ignored during normalization."""
+        agent = make_span(
+            trace_id="t1",
+            span_id="agent-1",
+            name="coordinator",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={"openinference.span.kind": "AGENT"},
+        )
+        turn = make_span(
+            trace_id="t1",
+            span_id="turn-1",
+            parent_span_id="agent-1",
+            name="turn",
+            scope_name=OPENAI_AGENTS_SCOPE_NAME,
+            attributes={"openinference.span.kind": "CHAIN"},
+        )
+        # A LangChain LLM span nested under the OpenAI agent's subtree
+        foreign_llm = make_span(
+            trace_id="t1",
+            span_id="foreign-llm",
+            parent_span_id="turn-1",
+            name="ChatOpenAI",
+            scope_name=SCOPE_NAME,  # langchain scope
+            attributes={
+                "openinference.span.kind": "LLM",
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "foreign prompt",
+                "llm.output_messages.0.message.role": "assistant",
+                "llm.output_messages.0.message.content": "foreign answer",
+            },
+        )
+        session = self.mapper.map_to_session([agent, turn, foreign_llm], "sess-1")
+        # The OpenAI agent should NOT pick up the foreign LLM's messages
+        agent_spans = [s for t in session.traces for s in t.spans if isinstance(s, AgentInvocationSpan)]
+        assert len(agent_spans) == 0  # agent has no LLMs from its own scope → dropped
+
+
+# =============================================================================
+# Integration Tests: Real OpenAI Agents SDK fixture (Live)
+# (openinference.instrumentation.openai_agents)
+#
+# These tests use ACTUAL spans produced by the instrumentor, validating that the
+# mapper handles real-world OpenAI Agents SDK trace structure:
+# - LLM "response" spans with tool_calls and plural contents.N message parts
+# - TOOL spans with bare-string output.value (the delegated sub-agent answer)
+# - AGENT spans with NO input/output (normalization injects from LLM descendants)
+# - CHAIN "turn" spans that are intermediaries (not mapped directly)
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def openai_agents_live_session():
+    """Map real OpenAI Agents SDK live spans to a Session."""
+    spans = _load_openai_agents_live_spans()
+    mapper = OpenInferenceSessionMapper()
+    return mapper.map_to_session(spans, "openai-agents-live-sess")
+
+
+class TestOpenAIAgentsLiveFixtureIntegration:
+    """Integration tests using a real OpenAI Agents SDK live trace.
+
+    Multi-agent, agents-as-tools pattern: a coordinator delegates to a
+    math_specialist via an `ask_math_specialist` tool; the specialist uses
+    multiply_numbers / divide_numbers to answer "42 multiplied by 17, then
+    divided by 3".
+    """
+
+    def test_session_has_traces(self, openai_agents_live_session):
+        """Live fixture produces at least one trace."""
+        assert len(openai_agents_live_session.traces) >= 1
+
+    def test_tool_span_is_multiply_numbers(self, openai_agents_live_session):
+        """The multiply_numbers tool is correctly identified with arguments and result."""
+        all_spans = [s for t in openai_agents_live_session.traces for s in t.spans]
+        tool_spans = [s for s in all_spans if isinstance(s, ToolExecutionSpan)]
+        assert len(tool_spans) >= 1
+
+        multiply = next((s for s in tool_spans if s.tool_call.name == "multiply_numbers"), None)
+        assert multiply is not None
+        assert multiply.tool_call.arguments == {"a": 42, "b": 17}
+        assert multiply.tool_result.content == "714"
+
+    def test_agent_span_has_prompt_and_response(self, openai_agents_live_session):
+        """Every agent span has a non-empty user_prompt and agent_response."""
+        all_spans = [s for t in openai_agents_live_session.traces for s in t.spans]
+        agent_spans = [s for s in all_spans if isinstance(s, AgentInvocationSpan)]
+        assert len(agent_spans) >= 1
+
+        for agent in agent_spans:
+            assert agent.user_prompt
+            assert agent.agent_response
+        assert any("42 multiplied by 17" in a.user_prompt for a in agent_spans)
+
+    def test_agent_span_has_tools(self, openai_agents_live_session):
+        """The specialist's math tools are attached to an agent span."""
+        all_spans = [s for t in openai_agents_live_session.traces for s in t.spans]
+        agent_spans = [s for s in all_spans if isinstance(s, AgentInvocationSpan)]
+        assert len(agent_spans) >= 1
+
+        tool_names = {t.name for a in agent_spans for t in a.available_tools}
+        assert "multiply_numbers" in tool_names
+
+    def test_chain_and_wrapper_agent_spans_filtered(self, openai_agents_live_session):
+        """CHAIN turns and wrapper AGENT spans (no input/output) are not mapped as AgentInvocation."""
+        all_spans = [s for t in openai_agents_live_session.traces for s in t.spans]
+        agent_spans = [s for s in all_spans if isinstance(s, AgentInvocationSpan)]
+        # Only the named agent (math_agent) should produce an AgentInvocationSpan,
+        # not the wrapper "Agent workflow" spans
+        for agent in agent_spans:
+            assert agent.user_prompt != ""
+            assert agent.agent_response != ""
+
+    def test_agent_span_count_per_trace(self, openai_agents_live_session):
+        """Both agents (coordinator + math_specialist) map; the wrapper is excluded."""
+        for trace in openai_agents_live_session.traces:
+            agent_spans = [s for s in trace.spans if isinstance(s, AgentInvocationSpan)]
+            assert len(agent_spans) == 2
+
+
+# =============================================================================
+# Integration Tests: Real OpenAI Agents SDK fixture (ADOT)
+# (openinference.instrumentation.openai_agents)
+#
+# These tests use ACTUAL spans produced by the instrumentor, validating that the
+# mapper handles real-world OpenAI Agents SDK trace structure:
+# - coordinator AGENT span whose LLM turn is tool-call-only (handoff, no text)
+# - "handoff to math_specialist" TOOL span; multiply_numbers TOOL span
+# - AGENT spans with NO input/output (normalization injects from LLM descendants)
+# - httpx / starlette spans (non-openinference) that must be filtered out
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def openai_agents_adot_session():
+    """Map real OpenAI Agents SDK ADOT spans (multi-agent) to a Session."""
+    spans = _load_openai_agents_adot_spans()
+    mapper = OpenInferenceSessionMapper()
+    return mapper.map_to_session(spans, "openai-agents-adot-sess")
+
+
+class TestOpenAIAgentsAdotFixtureIntegration:
+    """Integration tests using real OpenAI Agents SDK multi-agent trace from AgentCore."""
+
+    def test_session_has_one_trace(self, openai_agents_adot_session):
+        """All spans share one trace_id → one trace."""
+        assert len(openai_agents_adot_session.traces) == 1
+
+    def test_non_openinference_spans_filtered(self, openai_agents_adot_session):
+        """httpx and starlette spans are filtered out (wrong scope)."""
+        all_spans = [s for t in openai_agents_adot_session.traces for s in t.spans]
+        # The fixture has 16 raw spans but only scoped spans should be processed
+        assert len(all_spans) < 16
+
+    def test_multiply_numbers_tool_span(self, openai_agents_adot_session):
+        """multiply_numbers tool call is correctly extracted with arguments and result."""
+        all_spans = [s for t in openai_agents_adot_session.traces for s in t.spans]
+        tool_spans = [s for s in all_spans if isinstance(s, ToolExecutionSpan)]
+
+        multiply = next((s for s in tool_spans if s.tool_call.name == "multiply_numbers"), None)
+        assert multiply is not None
+        assert multiply.tool_call.arguments == {"a": 42, "b": 7}
+        assert multiply.tool_result.content == "294.0"
+
+    def test_math_specialist_agent_span(self, openai_agents_adot_session):
+        """math_specialist agent (the one that answered) has the computed result."""
+        all_spans = [s for t in openai_agents_adot_session.traces for s in t.spans]
+        agent_spans = [s for s in all_spans if isinstance(s, AgentInvocationSpan)]
+
+        # Select the specialist by its answer, not by the prompt: both the
+        # coordinator and math_specialist carry the top-level question, so the
+        # response is what distinguishes the agent that actually computed 294.
+        math_agent = next((a for a in agent_spans if "294" in (a.agent_response or "")), None)
+        assert math_agent is not None
+        assert "294" in math_agent.agent_response
+        # The specialist carries its own math tools (not the coordinator's transfer tools).
+        assert "multiply_numbers" in {t.name for t in math_agent.available_tools}
+
+    def test_coordinator_survives_with_delegation_output(self, openai_agents_adot_session):
+        """A tool-call-only orchestrator turn is captured, with the handoff as its output.
+
+        The coordinator's only LLM emits transfer tool calls and no text; the
+        delegation act is surfaced as its output so the invocation isn't dropped.
+        """
+        all_spans = [s for t in openai_agents_adot_session.traces for s in t.spans]
+        agent_spans = [s for s in all_spans if isinstance(s, AgentInvocationSpan)]
+
+        coordinator = next((a for a in agent_spans if "[delegated]" in (a.agent_response or "")), None)
+        assert coordinator is not None
+        assert "transfer_to_math_specialist" in coordinator.agent_response
+        # Its own transfer tools are attached, not the specialist's math tools.
+        assert "transfer_to_math_specialist" in {t.name for t in coordinator.available_tools}
+
+    def test_both_agents_survive(self, openai_agents_adot_session):
+        """Coordinator and math_specialist each map to their own agent span."""
+        for trace in openai_agents_adot_session.traces:
+            agent_spans = [s for s in trace.spans if isinstance(s, AgentInvocationSpan)]
+            assert len(agent_spans) == 2
+
+    def test_handoff_tool_owned_by_coordinator(self, openai_agents_adot_session):
+        """The handoff tool is attributed to the coordinator that issued it, not the receiver."""
+        all_spans = [s for t in openai_agents_adot_session.traces for s in t.spans]
+        coordinator = next(
+            s for s in all_spans if isinstance(s, AgentInvocationSpan) and "[delegated]" in (s.agent_response or "")
+        )
+        handoff = next(
+            s for s in all_spans if isinstance(s, ToolExecutionSpan) and s.tool_call.name.startswith("handoff")
+        )
+        assert handoff.agent_span_id == coordinator.span_info.span_id
+
+    def test_multiply_numbers_owned_by_math_specialist(self, openai_agents_adot_session):
+        """The multiply_numbers tool is attributed to the specialist that ran it."""
+        all_spans = [s for t in openai_agents_adot_session.traces for s in t.spans]
+        specialist = next(
+            s for s in all_spans if isinstance(s, AgentInvocationSpan) and "[delegated]" not in (s.agent_response or "")
+        )
+        multiply = next(
+            s for s in all_spans if isinstance(s, ToolExecutionSpan) and s.tool_call.name == "multiply_numbers"
+        )
+        assert multiply.agent_span_id == specialist.span_info.span_id
+        assert multiply.span_info.parent_span_id == specialist.span_info.span_id
+
+    def test_all_spans_have_session_id(self, openai_agents_adot_session):
+        """All converted spans carry the session_id."""
+        all_spans = [s for t in openai_agents_adot_session.traces for s in t.spans]
+        for span in all_spans:
+            assert span.span_info.session_id == "openai-agents-adot-sess"

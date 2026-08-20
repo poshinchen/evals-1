@@ -5,6 +5,7 @@ Handles traces from any producer in the OpenInference family:
 - openinference.instrumentation.langchain (LangChain / LangGraph)
 - openinference.instrumentation.smolagents (HuggingFace smolagents)
 - openinference.instrumentation.claude_agent_sdk (Claude Agent SDK)
+- openinference.instrumentation.openai_agents (OpenAI Agents SDK)
 
 Each producer emits spans following the OpenInference semantic conventions but
 with producer-specific encoding differences (e.g. attribute paths for message
@@ -38,11 +39,12 @@ from ..types.trace import (
 from .constants import (
     SCOPE_OPENINFERENCE,
     SCOPE_OPENINFERENCE_CLAUDE_AGENT_SDK,
+    SCOPE_OPENINFERENCE_OPENAI_AGENTS,
     SCOPE_OPENINFERENCE_SMOLAGENTS,
     SCOPES_OPENINFERENCE_FAMILY,
 )
 from .session_mapper import SessionMapper
-from .utils import safe_json_parse
+from .utils import bridge_parent_gaps, safe_json_parse
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +69,13 @@ class OpenInferenceSessionMapper(SessionMapper):
     - openinference-instrumentation-langchain (LangChain / LangGraph)
     - openinference-instrumentation-smolagents (HuggingFace smolagents)
     - openinference-instrumentation-claude-agent-sdk (Claude Agent SDK)
+    - openinference-instrumentation-openai-agents (OpenAI Agents SDK)
 
     Span type identification uses the openinference.span.kind attribute:
     - Inference spans: "LLM"
     - Tool execution spans: "TOOL"
-    - Agent invocation spans: "AGENT" (smolagents CodeAgent.run, Claude Agent SDK query) or
-      "CHAIN" with name="LangGraph" (LangGraph root graph)
+    - Agent invocation spans: "AGENT" (smolagents CodeAgent.run, Claude Agent SDK query,
+      OpenAI Agents SDK agent) or "CHAIN" with name="LangGraph" (LangGraph root graph)
 
     Producer-specific encoding differences (e.g. message attribute paths,
     tool argument wrapping) are normalized before shared conversion logic runs.
@@ -90,6 +93,8 @@ class OpenInferenceSessionMapper(SessionMapper):
         self._trace_tools_map: dict[str, dict[str, ToolConfig]] = defaultdict(dict)
         # Track system prompts per trace
         self._trace_system_prompt_map: dict[str, str] = defaultdict(str)
+        # Track span_id -> parent_span_id for ALL raw spans (including non-OpenInference scopes)
+        self._raw_parent_map: dict[str, str | None] = {}
         # Cache: span_id -> (input_messages, output_messages) from _get_messages_from_span_events
         # Avoids re-parsing span_events body during detection and again during conversion.
         self._span_messages_cache: dict[str, tuple[list[dict], list[dict]]] = {}
@@ -118,20 +123,38 @@ class OpenInferenceSessionMapper(SessionMapper):
         # Normalize input to flat spans
         spans = self._normalize_to_flat_spans(data)
 
+        # Build parent map from ALL spans
+        self._raw_parent_map = {s.get("span_id", ""): s.get("parent_span_id") for s in spans}
+
         # Filter to only spans from this scope (including smolagents variant)
         openinference_spans = [s for s in spans if self._get_scope_name(s) in SCOPES_OPENINFERENCE_FAMILY]
 
         # Per-producer normalization: canonicalize encoding differences so the
         # shared conversion logic receives a uniform representation.
         for span in openinference_spans:
-            if self._get_scope_name(span) == SCOPE_OPENINFERENCE_SMOLAGENTS:
-                self._normalize_smolagents_span(span)
+            scope = self._get_scope_name(span)
+            try:
+                if scope == SCOPE_OPENINFERENCE_SMOLAGENTS:
+                    self._normalize_smolagents_span(span)
+                elif scope == SCOPE_OPENINFERENCE_OPENAI_AGENTS:
+                    self._normalize_openai_agents_span(span)
+            except Exception as e:
+                span_id = span.get("span_id", "unknown")
+                logger.warning("scope=<%s>, span_id=<%s> | failed to normalize span: %s", scope, span_id, e)
 
         # Group spans by trace_id
         grouped = defaultdict(list)
         for span in openinference_spans:
             trace_id = span.get("trace_id", "")
             grouped[trace_id].append(span)
+
+        # OpenAI Agents SDK normalization requires the full trace group, so it runs after grouping.
+        for trace_spans in grouped.values():
+            if any(self._get_scope_name(s) == SCOPE_OPENINFERENCE_OPENAI_AGENTS for s in trace_spans):
+                try:
+                    self._normalize_openai_agents_trace(trace_spans)
+                except Exception as e:
+                    logger.warning("failed to normalize openai agents trace: %s", e)
 
         # Build traces
         result_traces: list[Trace] = []
@@ -258,6 +281,107 @@ class OpenInferenceSessionMapper(SessionMapper):
             # Fallback: no tool.parameters available to map positional args
             attrs["input.value"] = json.dumps({"args": args})
 
+    def _normalize_openai_agents_span(self, span: dict) -> None:
+        """Normalize OpenAI Agents spans in-place.
+
+        This normalizes by:
+        1. Unwrapping tool schemas in the format {"type": "function", "function": {...}}.
+        2. Aliasing "parameters" to "input_schema" on tool schemas.
+        """
+        attrs = span.get("attributes") or {}
+        for idx in self._extract_message_indices(attrs, "llm.tools"):
+            key = f"llm.tools.{idx}.tool.json_schema"
+            raw = attrs.get(key)
+            if isinstance(raw, str):
+                try:
+                    schema = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                schema = raw
+            if not isinstance(schema, dict):
+                continue
+            if "name" not in schema and isinstance(schema.get("function"), dict):
+                schema = schema["function"]
+            if "input_schema" not in schema and "parameters" in schema:
+                schema["input_schema"] = schema["parameters"]
+            attrs[key] = json.dumps(schema)
+
+    def _normalize_openai_agents_trace(self, spans: list[dict]) -> None:
+        """Normalize OpenAI Agents SDK trace in-place.
+
+        This normalizes by:
+        1. Copying the user prompt, assistant response, and tool schemas from
+           LLM spans to parent AGENT spans
+        2. Falling back the assistant response to the last tool calls in the message
+        """
+        # Collect all spans keyed by parent id for span traversal
+        spans_by_parent_id: dict[str, list[dict]] = defaultdict(list)
+        for s in spans:
+            parent = s.get("parent_span_id")
+            if parent:
+                spans_by_parent_id[parent].append(s)
+
+        for span in spans:
+            attrs = span.get("attributes") or {}
+            span_id = span.get("span_id", "")
+            if (
+                attrs.get("openinference.span.kind") != "AGENT"
+                or attrs.get("input.value")
+                or not span_id
+                or self._get_scope_name(span) != SCOPE_OPENINFERENCE_OPENAI_AGENTS
+            ):
+                continue
+
+            llm_spans = self._collect_descendant_llm_spans(span_id, spans_by_parent_id)
+            if not llm_spans:
+                continue
+
+            first_attrs = llm_spans[0].get("attributes", {})
+            user_prompt = self._extract_last_message_text(first_attrs, "llm.input_messages", role="user")
+            if user_prompt:
+                attrs["input.value"] = user_prompt
+
+            # Copy LLM tool schemas onto the AGENT span for available_tools back-filling
+            for tool_idx in self._extract_message_indices(first_attrs, "llm.tools"):
+                key = f"llm.tools.{tool_idx}.tool.json_schema"
+                schema = first_attrs.get(key)
+                if schema is not None:
+                    attrs[key] = schema
+
+            last_attrs = llm_spans[-1].get("attributes", {})
+            agent_response = self._extract_last_message_text(last_attrs, "llm.output_messages")
+
+            # Fallback the response to the last message's tool calls if no LLM output was found
+            if not agent_response:
+                tool_calls = self._extract_last_tool_calls(last_attrs)
+                if tool_calls:
+                    agent_response = f"[delegated] {tool_calls}"
+            if agent_response:
+                attrs["output.value"] = agent_response
+
+    def _collect_descendant_llm_spans(self, span_id: str, spans_by_parent_id: dict[str, list[dict]]) -> list[dict]:
+        """Return the LLM spans descending from `span_id`, earliest first."""
+        llm_spans: list[dict] = []
+        stack = [span_id]
+        # Traverse the spans in top-down order
+        seen: set[str] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for child in spans_by_parent_id.get(current, []):
+                kind = (child.get("attributes") or {}).get("openinference.span.kind", "")
+                if kind == "LLM" and self._get_scope_name(child) == SCOPE_OPENINFERENCE_OPENAI_AGENTS:
+                    llm_spans.append(child)
+                elif kind == "CHAIN":
+                    cid = child.get("span_id", "")
+                    if cid:
+                        stack.append(cid)
+        llm_spans.sort(key=lambda s: self.parse_timestamp(s.get("start_time")))
+        return llm_spans
+
     def _build_trace(self, trace_id: str, spans: list[dict], session_id: str) -> Trace:
         """Build a Trace from spans with the same trace_id."""
         converted_spans: list[InferenceSpan | ToolExecutionSpan | AgentInvocationSpan] = []
@@ -304,6 +428,9 @@ class OpenInferenceSessionMapper(SessionMapper):
             for converted in converted_spans:
                 if isinstance(converted, AgentInvocationSpan) and not converted.system_prompt:
                     converted.system_prompt = system_prompt
+
+        # Fix parent_span_id on converted spans that point to skipped intermediaries.
+        converted_spans = bridge_parent_gaps(converted_spans, self._raw_parent_map)
 
         return Trace(spans=converted_spans, trace_id=trace_id, session_id=session_id)
 
@@ -380,7 +507,11 @@ class OpenInferenceSessionMapper(SessionMapper):
         # routing nodes that aren't true agent invocations — reject those by default.
         if span_kind == "AGENT":
             scope_name = self._get_scope_name(span)
-            if scope_name in (SCOPE_OPENINFERENCE_SMOLAGENTS, SCOPE_OPENINFERENCE_CLAUDE_AGENT_SDK):
+            if scope_name in (
+                SCOPE_OPENINFERENCE_SMOLAGENTS,
+                SCOPE_OPENINFERENCE_CLAUDE_AGENT_SDK,
+                SCOPE_OPENINFERENCE_OPENAI_AGENTS,
+            ):
                 input_val = attrs.get("input.value")
                 if input_val:
                     output_val = attrs.get("output.value")
@@ -636,7 +767,7 @@ class OpenInferenceSessionMapper(SessionMapper):
             logger.warning(f"No agent_response for agent span {span.get('span_id')}")
             return None
 
-        available_tools = sorted(
+        available_tools = self._extract_tools_from_attributes(attrs) or sorted(
             self._trace_tools_map.get(trace_id, {}).values(),
             key=lambda t: t.name,
         )
@@ -656,6 +787,65 @@ class OpenInferenceSessionMapper(SessionMapper):
     # =========================================================================
     # Helper Methods
     # =========================================================================
+
+    def _extract_message_indices(self, attrs: dict, prefix: str) -> list[int]:
+        """Return the numeric indices N found in keys starting with `{prefix}.N.`, highest first."""
+        prefix_dot = f"{prefix}."
+        indices: set[int] = set()
+        for key in attrs:
+            if key.startswith(prefix_dot):
+                seg = key.removeprefix(prefix_dot).split(".", 1)[0]
+                if seg.isascii() and seg.isdigit():
+                    indices.add(int(seg))
+        return sorted(indices, reverse=True)
+
+    def _extract_last_message_text(self, attrs: dict, prefix: str, role: str | None = None) -> str | None:
+        """Return the text of the last matching message, or None."""
+        for idx in self._extract_message_indices(attrs, prefix):
+            base = f"{prefix}.{idx}.message"
+            role_match = role is None or attrs.get(f"{base}.role") == role
+            is_reasoning = attrs.get(f"{base}.contents.0.message_content.type") == "reasoning"
+            text = attrs.get(f"{base}.content") or self._extract_text_from_content_parts(attrs, base)
+            if role_match and not is_reasoning and text:
+                return text
+        return None
+
+    def _extract_text_from_content_parts(self, attrs: dict, base: str) -> str | None:
+        """Concatenate all `text` parts under `{base}.contents.N`, or None.
+
+        Multimodal messages emit ordered parts (e.g. [image, text]), so scan every
+        part rather than only index 0.
+        """
+        parts: list[str] = []
+        i = 0
+        while True:
+            part_type = attrs.get(f"{base}.contents.{i}.message_content.type")
+            if part_type is None:
+                break
+            if part_type == "text":
+                text = attrs.get(f"{base}.contents.{i}.message_content.text")
+                if text:
+                    parts.append(text)
+            i += 1
+        return "".join(parts) or None
+
+    def _extract_last_tool_calls(self, attrs: dict) -> str | None:
+        """Return a text rendering of the last assistant message's tool calls, or None."""
+        prefix = "llm.output_messages"
+        for idx in self._extract_message_indices(attrs, prefix):
+            base = f"{prefix}.{idx}.message"
+            calls: list[str] = []
+            i = 0
+            while True:
+                name = attrs.get(f"{base}.tool_calls.{i}.tool_call.function.name")
+                if not name:
+                    break
+                args = attrs.get(f"{base}.tool_calls.{i}.tool_call.function.arguments", "")
+                calls.append(f"{name}({args})" if args else f"{name}()")
+                i += 1
+            if calls:
+                return "; ".join(calls)
+        return None
 
     @staticmethod
     def _extract_llm_metadata(attrs: dict) -> dict:
@@ -833,7 +1023,7 @@ class OpenInferenceSessionMapper(SessionMapper):
                             parameters=tool_info.get("input_schema"),
                         )
                     )
-                except (json.JSONDecodeError, AttributeError):
+                except (json.JSONDecodeError, AttributeError, ValueError):
                     pass
 
         return sorted(tools, key=lambda t: t.name or "")
