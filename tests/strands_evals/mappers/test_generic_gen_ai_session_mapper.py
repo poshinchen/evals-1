@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from strands_evals.mappers import GenericGenAISessionMapper, detect_otel_mapper
-from strands_evals.types.trace import AgentInvocationSpan, InferenceSpan, ToolExecutionSpan
+from strands_evals.types.trace import (
+    AgentInvocationSpan,
+    InferenceSpan,
+    ToolExecutionSpan,
+)
 
 
 def make_span(
@@ -35,6 +39,16 @@ def make_span(
         "status": {"code": "OK"},
         "span_events": span_events or [],
     }
+
+
+def _user_msg(text):
+    """Build a gen_ai.input.messages JSON string with a single user text part."""
+    return json.dumps([{"role": "user", "parts": [{"type": "text", "content": text}]}])
+
+
+def _assistant_msg(text):
+    """Build a gen_ai.output.messages JSON string with a single assistant text part."""
+    return json.dumps([{"role": "assistant", "parts": [{"type": "text", "content": text}]}])
 
 
 class TestToolExecutionSpan:
@@ -257,6 +271,44 @@ class TestAgentInvocationSpan:
         assert isinstance(agent, AgentInvocationSpan)
         assert agent.user_prompt == "Hello"
         assert agent.agent_response == "Hi there!"
+
+    def test_malformed_optional_fields_fall_back_to_name_only(self):
+        """Non-str description and non-dict parameters degrade to name-only ToolConfig."""
+        attrs = {
+            "gen_ai.tool.definitions": json.dumps(
+                [
+                    {"type": "function", "function": {"name": "bad", "description": 42, "parameters": '{"x":1}'}},
+                    {
+                        "type": "function",
+                        "function": {"name": "good", "description": "ok", "parameters": {"x": {"type": "int"}}},
+                    },
+                ]
+            )
+        }
+        configs = GenericGenAISessionMapper._parse_tool_definitions(attrs)
+        assert len(configs) == 2
+        bad, good = configs
+        assert bad.name == "bad"
+        assert bad.description is None
+        assert bad.parameters is None
+        assert good.name == "good"
+        assert good.description == "ok"
+        assert good.parameters == {"x": {"type": "int"}}
+
+    def test_malformed_name_skips_tool_without_dropping_span(self):
+        """Non-str name is skipped rather than raising a ValidationError."""
+        attrs = {
+            "gen_ai.tool.definitions": json.dumps(
+                [
+                    {"type": "function", "function": {"name": {"nested": True}}},
+                    {"type": "function", "function": {"name": 123}},
+                    {"type": "function", "function": {"name": "valid_tool"}},
+                ]
+            )
+        }
+        configs = GenericGenAISessionMapper._parse_tool_definitions(attrs)
+        assert len(configs) == 1
+        assert configs[0].name == "valid_tool"
 
 
 class TestInferenceSpan:

@@ -5,7 +5,7 @@ Handles spans from any framework that uses OpenTelemetry GenAI semantic conventi
 (gen_ai.operation.name, gen_ai.tool.name, etc.) but has an unrecognized scope name.
 
 This is the fallback mapper for spans that don't match any known instrumentor scope
-(Strands, OpenInference, LangChain) but still carry structured gen_ai.* attributes.
+but still carry structured gen_ai.* attributes.
 """
 
 import json
@@ -114,9 +114,16 @@ class GenericGenAISessionMapper(SessionMapper):
 
     def _convert_trace(self, trace_id: str, spans: list[dict], session_id: str) -> Trace:
         """Convert a list of dict spans (same trace_id) to a Trace."""
+        # Build parent map from the original span hierarchy to bridge through filtered-out intermediaries.
+        raw_parent_map: dict[str, str | None] = {
+            sid: s.get("parent_span_id") for s in spans if (sid := s.get("span_id"))
+        }
+
+        spans_to_convert = self._prepare_trace_spans(spans)
+
         converted_spans: list[InferenceSpan | ToolExecutionSpan | AgentInvocationSpan] = []
 
-        for span in spans:
+        for span in spans_to_convert:
             try:
                 attrs = span.get("attributes", {})
                 operation_name = attrs.get("gen_ai.operation.name", "")
@@ -151,12 +158,40 @@ class GenericGenAISessionMapper(SessionMapper):
                 )
 
         # Fix parent_span_id on converted spans that point to skipped intermediaries
-        raw_parent_map: dict[str, str | None] = {
-            sid: s.get("parent_span_id") for s in spans if (sid := s.get("span_id"))
-        }
         converted_spans = bridge_parent_gaps(converted_spans, raw_parent_map)
 
-        return Trace(spans=converted_spans, trace_id=trace_id, session_id=session_id)
+        trace = Trace(spans=converted_spans, trace_id=trace_id, session_id=session_id)
+        return self._enrich_trace(trace, spans_to_convert)
+
+    def _prepare_trace_spans(self, spans: list[dict]) -> list[dict]:
+        """Hook to prepare raw spans before conversion.
+
+        Subclasses can override this to add, remove, or replace spans before conversion.
+        Overrides should return the updated spans rather than mutating the originals in place.
+
+        Args:
+            spans: Raw span dicts belonging to a single trace.
+
+        Returns:
+            Spans to convert, which may be a subset, superset, or replacement of input.
+        """
+        return spans
+
+    def _enrich_trace(self, trace: Trace, spans: list[dict]) -> Trace:
+        """Hook to enrich a converted Trace using the prepared span dicts.
+
+        Subclasses can override this to backfill data from child spans or perform
+        framework-specific post-processing. Overrides may mutate the trace in-place.
+
+        Args:
+            trace: Fully converted Trace.
+            spans: Span dicts used for conversion. Useful for accessing
+                raw attributes not carried over into typed spans.
+
+        Returns:
+            The enriched Trace.
+        """
+        return trace
 
     def _parse_json_attr(self, attributes: Any, key: str, default: str = "[]") -> Any:
         """Parse a JSON-encoded attribute value."""
@@ -325,20 +360,7 @@ class GenericGenAISessionMapper(SessionMapper):
 
         user_prompt = ""
         agent_response = ""
-        available_tools: list[ToolConfig] = []
-
-        # Parse available tools from gen_ai.agent.tools or gen_ai.tool.definitions
-        try:
-            tools_json = attrs.get("gen_ai.agent.tools", "") or attrs.get("gen_ai.tool.definitions", "[]")
-            tool_list = json.loads(str(tools_json)) if isinstance(tools_json, str) else tools_json
-            if isinstance(tool_list, list):
-                for item in tool_list:
-                    if isinstance(item, str):
-                        available_tools.append(ToolConfig(name=item))
-                    elif isinstance(item, dict):
-                        available_tools.append(ToolConfig(name=item.get("name", "")))
-        except (json.JSONDecodeError, TypeError):
-            pass
+        available_tools = self._parse_tool_definitions(attrs)
 
         # Extract from span_events (manual instrumentation format)
         for event in span.get("span_events", []):
@@ -431,6 +453,37 @@ class GenericGenAISessionMapper(SessionMapper):
     # =========================================================================
     # Content Processing Helpers
     # =========================================================================
+
+    @staticmethod
+    def _parse_tool_definitions(attributes: dict) -> list[ToolConfig]:
+        """Parse available tools from a span's gen_ai.agent.tools or gen_ai.tool.definitions."""
+        raw = attributes.get("gen_ai.agent.tools", "") or attributes.get("gen_ai.tool.definitions", "[]")
+        try:
+            tool_list = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(tool_list, list):
+            return []
+
+        configs: list[ToolConfig] = []
+        for item in tool_list:
+            if isinstance(item, str):
+                if item:
+                    configs.append(ToolConfig(name=item))
+            elif isinstance(item, dict):
+                fn = item["function"] if isinstance(item.get("function"), dict) else item
+                name = fn.get("name", "")
+                if isinstance(name, str) and name:
+                    description = fn.get("description")
+                    parameters = fn.get("parameters")
+                    configs.append(
+                        ToolConfig(
+                            name=name,
+                            description=str(description) if isinstance(description, str) else None,
+                            parameters=parameters if isinstance(parameters, dict) else None,
+                        )
+                    )
+        return configs
 
     def _convert_message_list_from_event(self, event_attrs: dict) -> list[UserMessage | AssistantMessage]:
         """Parse operation.details event attrs and return typed messages via _convert_message_list."""
