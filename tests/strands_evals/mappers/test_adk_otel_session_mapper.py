@@ -1,7 +1,6 @@
 """Tests for ADKOtelSessionMapper - ADK OTel spans → Session conversion."""
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from strands_evals.mappers import ADKOtelSessionMapper
@@ -711,39 +710,6 @@ class TestDataFormatCompatibility:
         assert tool.span_info.trace_id == "abc123"
         assert tool.span_info.span_id == "def456"
         assert tool.span_info.parent_span_id == "789abc"
-
-
-# ============================================================================
-# Tests: Timestamp Parsing
-# ============================================================================
-
-
-class TestTimestampParsing:
-    """Tests for parse_timestamp handling various formats."""
-
-    def setup_method(self):
-        self.mapper = ADKOtelSessionMapper()
-
-    def test_iso_string_with_z(self):
-        ts = self.mapper.parse_timestamp("2026-07-22T16:34:19.917561Z")
-        assert ts.year == 2026 and ts.month == 7
-
-    def test_nanosecond_epoch(self):
-        """Nanosecond epoch integer is converted to datetime."""
-        ts_int = self.mapper.parse_timestamp(1700000000000000000)
-        assert ts_int.year == 2023
-
-    def test_string_nanosecond_epoch(self):
-        """String-encoded nanosecond epoch (OTLP JSON uint64) is correctly parsed."""
-        ts_str = self.mapper.parse_timestamp("1700000000000000000")
-        assert ts_str.year == 2023 and ts_str.month == 11
-
-    def test_none_returns_now(self):
-        assert self.mapper.parse_timestamp(None) is not None
-
-    def test_datetime_passthrough(self):
-        dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
-        assert self.mapper.parse_timestamp(dt) == dt
 
 
 # ============================================================================

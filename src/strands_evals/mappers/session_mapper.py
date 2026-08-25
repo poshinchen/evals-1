@@ -79,10 +79,13 @@ class SessionMapper(ABC):
 
         Handles:
         - None → current UTC time
-        - datetime → passthrough
-        - ISO 8601 string (with optional trailing Z) → parsed datetime
-        - Numeric (int/float) nanosecond epoch → datetime
-        - String-encoded nanosecond epoch → datetime
+        - datetime → converted to UTC
+        - ISO 8601 string (with optional trailing Z) → parsed and normalized to UTC
+        - Numeric (int/float) nanosecond epoch → converted to UTC datetime
+        - String-encoded nanosecond epoch → converted to UTC datetime
+
+        Naive datetimes and offset-less ISO strings are assumed to be UTC, not
+        local time: a source emitting local timestamps is shifted by its offset.
 
         Args:
             value: Raw timestamp value from a span dict.
@@ -93,15 +96,23 @@ class SessionMapper(ABC):
         if value is None:
             return datetime.now(timezone.utc)
         if isinstance(value, datetime):
-            return value
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            try:
+                return value.astimezone(timezone.utc)
+            except OverflowError:
+                return datetime.now(timezone.utc)
         if isinstance(value, str):
             if value.isdigit():
                 return datetime.fromtimestamp(int(value) / 1e9, tz=timezone.utc)
             try:
                 if value.endswith("Z"):
                     value = value[:-1] + "+00:00"
-                return datetime.fromisoformat(value)
-            except ValueError:
+                dt = datetime.fromisoformat(value)
+                if dt.tzinfo is None:
+                    return dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except (ValueError, OverflowError):
                 return datetime.now(timezone.utc)
         if isinstance(value, (int, float)):
             # Handle nanoseconds

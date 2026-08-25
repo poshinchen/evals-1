@@ -2456,7 +2456,7 @@ class TestOpenAIAgentsScopeSupport:
             name="response",
             scope_name=OPENAI_AGENTS_SCOPE_NAME,
             attributes=dict(llm_common),
-            start_time="2024-01-01T00:00:00Z",
+            start_time="2024-01-01T00:00:00",
         )  # ISO string
 
         # Should not raise, and the agent span is still produced.
