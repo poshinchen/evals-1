@@ -1,3 +1,5 @@
+import json
+import logging
 from unittest.mock import Mock, patch
 
 import pytest
@@ -281,6 +283,63 @@ def test_output_evaluator_init_without_tools_defaults_to_none():
     evaluator = OutputEvaluator(rubric="Test rubric")
 
     assert evaluator.tools is None
+
+
+def test_output_evaluator_to_dict_skips_non_serializable_tools(caplog):
+    """Test that to_dict() output is JSON-serializable when callable tools are set (issue #373)"""
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[verify_claim])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert "tools" not in evaluator_dict
+    json.dumps(evaluator_dict)
+    assert "skipping non-JSON-serializable tool" in caplog.text
+
+
+def test_output_evaluator_to_dict_keeps_serializable_tools(caplog):
+    """Test that serializable tools survive to_dict() while callables are skipped"""
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=["my_pkg.calculator", verify_claim])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert evaluator_dict["tools"] == ["my_pkg.calculator"]
+    json.dumps(evaluator_dict)
+    assert "skipping non-JSON-serializable tool" in caplog.text
+
+
+def test_output_evaluator_to_dict_skips_circular_reference_tools(caplog):
+    """Test that tools raising ValueError (circular reference) are skipped, not crashed on"""
+    circular: dict = {"name": "circular_tool"}
+    circular["self"] = circular
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[circular, "my_pkg.calculator"])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert evaluator_dict["tools"] == ["my_pkg.calculator"]
+    json.dumps(evaluator_dict)
+    assert "skipping non-JSON-serializable tool" in caplog.text
+
+
+def test_output_evaluator_tools_setter():
+    """Test that tools can be reassigned after initialization"""
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric")
+    evaluator.tools = [verify_claim]
+
+    assert evaluator.tools == [verify_claim]
+    assert "tools" not in evaluator.to_dict()
 
 
 @patch("strands_evals.evaluators.output_evaluator.Agent")
