@@ -313,6 +313,9 @@ def test_output_evaluator_to_dict_keeps_serializable_tools(caplog):
     assert evaluator_dict["tools"] == ["my_pkg.calculator"]
     json.dumps(evaluator_dict)
     assert "skipping non-JSON-serializable tool" in caplog.text
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1  # the serializable tool must not warn
+    assert "verify_claim" in warnings[0].getMessage()  # names which tool to re-attach
 
 
 def test_output_evaluator_to_dict_skips_circular_reference_tools(caplog):

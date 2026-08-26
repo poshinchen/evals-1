@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
+from strands import tool as strands_tool
 from strands.models.model import Model
 from strands.types.exceptions import EventLoopException, ModelThrottledException
 
@@ -794,6 +795,28 @@ def test_experiment_from_dict_builtin_evaluators_round_trip(evaluator_type):
     experiment = Experiment.from_dict({"cases": [], "evaluators": [serialized]})
     assert len(experiment.evaluators) == 1
     assert isinstance(experiment.evaluators[0], cls)
+
+
+def test_experiment_to_file_round_trip_with_evaluator_tools(tmp_path):
+    """OutputEvaluator with tools survives to_file/from_file: string tools round-trip,
+    decorated-function tools are skipped instead of crashing serialization (issue #373)."""
+
+    @strands_tool
+    def verify_claim(claim: str) -> str:
+        """Verify a claim."""
+        return "verified"
+
+    cases = [Case(name="test", input="hello")]
+    evaluator = OutputEvaluator(rubric="rubric", tools=[verify_claim, "my_pkg.calculator"])
+    experiment = Experiment(cases=cases, evaluators=[evaluator])
+    file_path = tmp_path / "experiment.json"
+
+    experiment.to_file(str(file_path))
+    loaded = Experiment.from_file(str(file_path))
+
+    assert len(loaded.evaluators) == 1
+    assert isinstance(loaded.evaluators[0], OutputEvaluator)
+    assert loaded.evaluators[0].tools == ["my_pkg.calculator"]
 
 
 @pytest.mark.asyncio

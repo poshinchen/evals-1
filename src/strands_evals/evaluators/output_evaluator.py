@@ -77,9 +77,11 @@ class OutputEvaluator(Evaluator[InputT, OutputT]):
                 try:
                     json.dumps(tool)
                 except (TypeError, ValueError):
-                    tool_name = getattr(tool, "tool_name", None) or repr(tool)
+                    tool_name = (
+                        getattr(tool, "tool_name", None) or getattr(tool, "__name__", None) or type(tool).__name__
+                    )
                     logger.warning(
-                        "skipping non-JSON-serializable tool <%s> during serialization; "
+                        "tool_name=<%s> | skipping non-JSON-serializable tool during serialization, "
                         "re-attach it via the `tools` attribute after loading",
                         tool_name,
                     )
