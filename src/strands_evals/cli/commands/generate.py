@@ -91,7 +91,9 @@ def _run(args: argparse.Namespace) -> int:
         # `Experiment.from_file` round-trips.
         experiment.to_file(args.output)
     else:
-        write_text_output(json.dumps(experiment.to_dict(), indent=2, ensure_ascii=False), None)
+        # allow_nan=False matches Experiment.to_file, so stdout and -o accept the
+        # same experiments. Neither can emit a literal NaN, which is not valid JSON.
+        write_text_output(json.dumps(experiment.to_dict(), indent=2, ensure_ascii=False, allow_nan=False), None)
 
     print(  # noqa: T201
         f"generated {len(experiment.cases)} case(s), {len(experiment.evaluators)} evaluator(s)",

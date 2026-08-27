@@ -820,14 +820,14 @@ def test_experiment_to_file_round_trip_with_evaluator_tools(tmp_path):
 
 
 def test_experiment_to_file_rejects_nan_without_corrupting_existing_file(tmp_path):
-    """to_file() raises on NaN values instead of writing RFC 8259-invalid JSON,
-    and leaves an existing file untouched (issue #380)."""
+    """to_file() raises on NaN values instead of writing invalid JSON, and leaves an
+    existing file untouched (issue #380)."""
     file_path = tmp_path / "experiment.json"
     Experiment(cases=[Case(name="ok", input="hello")]).to_file(str(file_path))
     original = file_path.read_bytes()
 
     bad = Experiment(cases=[Case(name="bad", input=float("nan"))])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Cannot write experiment"):
         bad.to_file(str(file_path))
 
     assert file_path.read_bytes() == original
@@ -839,10 +839,28 @@ def test_experiment_to_file_rejects_unpaired_surrogates_without_writing(tmp_path
     file_path = tmp_path / "experiment.json"
     bad = Experiment(cases=[Case(name="bad", input="path_\udcff")])
 
-    with pytest.raises(ValueError):  # UnicodeEncodeError is a ValueError subclass
+    # The UnicodeEncodeError is wrapped in the same ValueError as the NaN case.
+    with pytest.raises(ValueError, match="Cannot write experiment"):
         bad.to_file(str(file_path))
 
     assert not file_path.exists()
+
+
+def test_experiment_to_file_round_trips_after_skipping_unwritable_tools(tmp_path):
+    """An experiment whose bad evaluator tools were skipped by to_dict() must save and
+    reload cleanly. This guards against the tool check and the file writer drifting
+    apart again (issue #380)."""
+    evaluator = OutputEvaluator(
+        rubric="rubric",
+        tools=[{"name": "t", "default": float("nan")}, "my_pkg.calc_\udcff", "my_pkg.calculator"],
+    )
+    experiment = Experiment(cases=[Case(name="ok", input="hello")], evaluators=[evaluator])
+    file_path = tmp_path / "experiment.json"
+
+    experiment.to_file(str(file_path))
+    loaded = Experiment.from_file(str(file_path))
+
+    assert loaded.evaluators[0].tools == ["my_pkg.calculator"]
 
 
 @pytest.mark.asyncio

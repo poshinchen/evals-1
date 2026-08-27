@@ -744,8 +744,10 @@ class Experiment(Generic[InputT, OutputT]):
 
         Raises:
             ValueError: If the path has a non-JSON extension, or if the experiment contains
-                values that cannot be represented as strict JSON (e.g. NaN/Infinity floats
-                or strings with unpaired surrogates).
+                values that are not allowed in valid JSON, such as NaN or Infinity floats,
+                or strings with unpaired surrogates.
+            TypeError: If the experiment contains objects that are not JSON-serializable,
+                such as a custom class instance in case data or metadata.
         """
         file_path = Path(path)
 
@@ -758,15 +760,22 @@ class Experiment(Generic[InputT, OutputT]):
         else:
             file_path = file_path.with_suffix(".json")
 
+        # Serialize before touching the file. If the data cannot become valid JSON,
+        # the error is raised here and any existing file stays intact.
+        experiment_dict = self.to_dict()
+        try:
+            data = json.dumps(experiment_dict, indent=2, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except ValueError as e:
+            # UnicodeEncodeError is a subclass of ValueError, so this also catches
+            # unpaired surrogates. The original error stays attached as __cause__.
+            raise ValueError(
+                f"Cannot write experiment to {file_path}: it contains values that are not "
+                f"allowed in valid JSON, such as NaN or Infinity floats, or strings with "
+                f"unpaired surrogates. Check the case inputs, outputs, metadata, and evaluator fields."
+            ) from e
+
         file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Serialize and encode before opening the file so a failure (NaN/Infinity via
-        # allow_nan=False, unpaired surrogates via the utf-8 encode) raises loudly
-        # without leaving a truncated, invalid JSON artifact behind.
-        data = json.dumps(self.to_dict(), indent=2, ensure_ascii=False, allow_nan=False).encode("utf-8")
-
-        with open(file_path, "wb") as f:
-            f.write(data)
+        file_path.write_bytes(data)
 
     @classmethod
     def from_dict(cls, data: dict, custom_evaluators: list[type[Evaluator]] | None = None):

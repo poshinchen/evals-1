@@ -52,8 +52,10 @@ class OutputEvaluator(Evaluator[InputT, OutputT]):
     def tools(self) -> list[Any] | None:
         """Optional tools for the evaluator agent.
 
-        Only JSON-serializable entries (e.g. module path strings) survive `to_dict()`;
-        callables are skipped with a warning and must be re-attached after `from_dict()`.
+        Only tools that can be written as valid JSON in a utf-8 file survive `to_dict()`,
+        for example module path strings. Tools that cannot (callables, NaN or Infinity
+        floats, strings with unpaired surrogates) are skipped with a warning and must be
+        re-attached after `from_dict()`.
         """
         return self._tools
 
@@ -66,25 +68,31 @@ class OutputEvaluator(Evaluator[InputT, OutputT]):
         Convert the evaluator into a dictionary.
 
         Returns:
-            dict: A dictionary containing the evaluator's information. Includes only the
-            JSON-serializable tools; non-serializable tools (e.g. decorated functions)
-            are skipped with a warning since `from_dict()` cannot reconstruct them.
+            dict: A dictionary containing the evaluator's information. Includes only tools
+            that can be written as valid JSON in a utf-8 file. Tools that cannot (decorated
+            functions, NaN or Infinity floats, strings with unpaired surrogates) are skipped
+            with a warning and must be re-attached after `from_dict()`.
         """
         _dict = super().to_dict()
         if self._tools:
             serializable_tools = []
             for tool in self._tools:
                 try:
-                    # Probe with the same strictness as Experiment.to_file()'s utf-8 writer:
-                    # the encode rejects unpaired surrogates, allow_nan=False rejects
-                    # NaN/Infinity (invalid per RFC 8259). UnicodeEncodeError is a ValueError.
+                    # Check each tool with the same settings Experiment.to_file() uses.
+                    # The utf-8 encode rejects unpaired surrogates. allow_nan=False
+                    # rejects NaN and Infinity, which are not allowed in valid JSON.
+                    # UnicodeEncodeError is a subclass of ValueError.
                     json.dumps(tool, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 except (TypeError, ValueError):
-                    tool_name = (
-                        getattr(tool, "tool_name", None) or getattr(tool, "__name__", None) or type(tool).__name__
-                    )
+                    tool_name = getattr(tool, "tool_name", None) or getattr(tool, "__name__", None)
+                    if not isinstance(tool_name, str):
+                        # The tool may be a plain string or a dict with no name attribute.
+                        # A short ascii() preview identifies it better than a type name.
+                        tool_name = ascii(tool)
+                        if len(tool_name) > 80:
+                            tool_name = tool_name[:77] + "..."
                     logger.warning(
-                        "tool_name=<%s> | skipping non-JSON-serializable tool during serialization, "
+                        "tool_name=<%s> | skipping tool that cannot be written as valid utf-8 JSON, "
                         "re-attach it via the `tools` attribute after loading",
                         tool_name,
                     )
