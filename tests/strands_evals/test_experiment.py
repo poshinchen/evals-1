@@ -819,6 +819,32 @@ def test_experiment_to_file_round_trip_with_evaluator_tools(tmp_path):
     assert loaded.evaluators[0].tools == ["my_pkg.calculator"]
 
 
+def test_experiment_to_file_rejects_nan_without_corrupting_existing_file(tmp_path):
+    """to_file() raises on NaN values instead of writing RFC 8259-invalid JSON,
+    and leaves an existing file untouched (issue #380)."""
+    file_path = tmp_path / "experiment.json"
+    Experiment(cases=[Case(name="ok", input="hello")]).to_file(str(file_path))
+    original = file_path.read_bytes()
+
+    bad = Experiment(cases=[Case(name="bad", input=float("nan"))])
+    with pytest.raises(ValueError):
+        bad.to_file(str(file_path))
+
+    assert file_path.read_bytes() == original
+
+
+def test_experiment_to_file_rejects_unpaired_surrogates_without_writing(tmp_path):
+    """to_file() raises on strings with unpaired surrogates instead of leaving a
+    truncated, invalid JSON file behind (issue #380)."""
+    file_path = tmp_path / "experiment.json"
+    bad = Experiment(cases=[Case(name="bad", input="path_\udcff")])
+
+    with pytest.raises(ValueError):  # UnicodeEncodeError is a ValueError subclass
+        bad.to_file(str(file_path))
+
+    assert not file_path.exists()
+
+
 @pytest.mark.asyncio
 async def test_experiment_run_evaluations_async():
     """Test run_evaluations_async with a simple task"""

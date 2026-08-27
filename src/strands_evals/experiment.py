@@ -743,7 +743,9 @@ class Experiment(Generic[InputT, OutputT]):
                   Only .json format is supported.
 
         Raises:
-            ValueError: If the path has a non-JSON extension.
+            ValueError: If the path has a non-JSON extension, or if the experiment contains
+                values that cannot be represented as strict JSON (e.g. NaN/Infinity floats
+                or strings with unpaired surrogates).
         """
         file_path = Path(path)
 
@@ -758,8 +760,13 @@ class Experiment(Generic[InputT, OutputT]):
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+        # Serialize and encode before opening the file so a failure (NaN/Infinity via
+        # allow_nan=False, unpaired surrogates via the utf-8 encode) raises loudly
+        # without leaving a truncated, invalid JSON artifact behind.
+        data = json.dumps(self.to_dict(), indent=2, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+        with open(file_path, "wb") as f:
+            f.write(data)
 
     @classmethod
     def from_dict(cls, data: dict, custom_evaluators: list[type[Evaluator]] | None = None):

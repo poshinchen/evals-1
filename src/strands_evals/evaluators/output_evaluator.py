@@ -75,7 +75,10 @@ class OutputEvaluator(Evaluator[InputT, OutputT]):
             serializable_tools = []
             for tool in self._tools:
                 try:
-                    json.dumps(tool)
+                    # Probe with the same strictness as Experiment.to_file()'s utf-8 writer:
+                    # the encode rejects unpaired surrogates, allow_nan=False rejects
+                    # NaN/Infinity (invalid per RFC 8259). UnicodeEncodeError is a ValueError.
+                    json.dumps(tool, ensure_ascii=False, allow_nan=False).encode("utf-8")
                 except (TypeError, ValueError):
                     tool_name = (
                         getattr(tool, "tool_name", None) or getattr(tool, "__name__", None) or type(tool).__name__

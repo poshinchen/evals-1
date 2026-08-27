@@ -332,6 +332,31 @@ def test_output_evaluator_to_dict_skips_circular_reference_tools(caplog):
     assert "skipping non-JSON-serializable tool" in caplog.text
 
 
+def test_output_evaluator_to_dict_skips_unpaired_surrogate_tools(caplog):
+    """Test that string tools with unpaired surrogates are skipped so the utf-8 writer
+    in Experiment.to_file() cannot crash on them (issue #380)"""
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=["my_pkg.calc_\udcff", "my_pkg.calculator"])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert evaluator_dict["tools"] == ["my_pkg.calculator"]
+    json.dumps(evaluator_dict, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    assert "skipping non-JSON-serializable tool" in caplog.text
+
+
+def test_output_evaluator_to_dict_skips_nan_tools(caplog):
+    """Test that dict tools containing NaN/Infinity are skipped so serialized output
+    stays RFC 8259-valid JSON (issue #380)"""
+    nan_tool = {"name": "t", "default": float("nan")}
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[nan_tool, "my_pkg.calculator"])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert evaluator_dict["tools"] == ["my_pkg.calculator"]
+    json.dumps(evaluator_dict, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    assert "skipping non-JSON-serializable tool" in caplog.text
+
+
 def test_output_evaluator_tools_setter():
     """Test that tools can be reassigned after initialization"""
 
