@@ -6,6 +6,7 @@ from typing_extensions import Self
 from ...case import Case
 from ...types import InputT, OutputT
 from .types import RedTeamConfig
+from .types.risk_category import resolve_risk_category
 
 
 class RedTeamCase(Case[InputT, OutputT]):
@@ -21,4 +22,7 @@ class RedTeamCase(Case[InputT, OutputT]):
         else:
             for key, value in dump.items():
                 self.metadata.setdefault(key, value)
+            # Metadata from a case saved before the risk category rename still carries the old slug.
+            if "risk_category" in self.metadata:
+                self.metadata["risk_category"] = resolve_risk_category(self.metadata["risk_category"])
         return self
