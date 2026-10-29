@@ -128,6 +128,21 @@ strands-evals/
 │   │
 │   ├── experimental/                         # Experimental features (no stability guarantees)
 │   │
+│   ├── optimization/                         # Experiment-design optimization (`optimization` extra: numpy + scipy)
+│   │   └── bayesbench/                       # Sequential Bayesian experimental design (EIG sampler)
+│   │       ├── README.md                     # Module quick-start
+│   │       ├── space.py / encoding.py        # Categorical grid + dummy-coded features
+│   │       ├── noise.py                      # Binomial plug-in observation noise
+│   │       ├── posterior.py                  # Conjugate Gaussian posterior (Cholesky, no explicit inverses)
+│   │       ├── acquisition.py / contrasts.py # Global + targeted expected information gain
+│   │       ├── sampler.py                    # InformationGainSampler (suggest/observe/predict/compare)
+│   │       ├── diagnostics.py                # Held-out z-score misspecification checks
+│   │       ├── hypotheses.py                 # Residual-based hypothesis candidates
+│   │       ├── paired.py                     # Paired bootstrap for within-benchmark compare()
+│   │       ├── recovery.py                   # Interaction-recovery metric
+│   │       ├── ledger.py                     # JSON-lines session log; replay rebuilds the sampler
+│   │       └── types.py                      # Frozen dataclasses (Observation, Prediction, ...)
+│   │
 │   ├── detectors/                            # Failure detection + RCA
 │   │   ├── failure_detector.py               # detect_failures (model.stream text mode)
 │   │   ├── root_cause_analyzer.py            # analyze_root_cause (Agent + structured output)
@@ -223,6 +238,8 @@ strands-evals/
 │   ├── chaos/
 │   ├── detectors/
 │   ├── experimental/
+│   ├── optimization/
+│   │   └── bayesbench/                       # Gate tests ported with the module (test_m0-test_m6, ...)
 │   ├── redteam/                          # Mirrors src/strands_evals/redteam/
 │   ├── simulation/
 │   ├── extractors/
@@ -249,6 +266,7 @@ strands-evals/
 
 - **`src/strands_evals/`**: All production code
 - **`src/strands_evals/cli/`**: `strands-evals` console script — six subcommands (`run`, `validate`, `report`, `diagnose`, `generate`, `fetch`) plus the `module:attr` resolver and synthesized task wrapper used by `--agent`. `fetch` has per-provider sub-subcommands (`cloudwatch`, `langfuse`, `opensearch`); langfuse / opensearch are imported lazily so they only fail when invoked without their extra installed.
+- **`src/strands_evals/optimization/`**: experiment-design optimizers. `bayesbench/` is a self-contained NumPy/SciPy module (no `strands.Agent` calls, no LLMs): a sequential Bayesian sampler that picks which benchmark configurations to run next by expected information gain. It needs the `optimization` extra; the rest of the package must not import it at module scope.
 - **`tests/strands_evals/`**: Unit tests mirroring src/ structure
 - **`tests/strands_evals/cli/`**: CLI tests; fixtures live under `cli/fixtures/` and are referenced by tests via `tests.strands_evals.cli.fixtures.*:attr` specs
 - **`tests_integ/`**: Integration tests using real trace providers and model endpoints
